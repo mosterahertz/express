@@ -167,6 +167,7 @@ namespace {
 
     bool handleSend(V2MIDI::Packet* midi) override {
       usb.midi.send(midi);
+      Plug.send(midi);
       return true;
     }
 
