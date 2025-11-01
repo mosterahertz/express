@@ -122,16 +122,8 @@ namespace {
     float          _rainbow{};
     V2MIDI::Packet _midi;
     
-    // Threshold parameters (hardcoded)
-    static constexpr float THRESHOLD_VALUE = 0.5f;  // Threshold for note on/off
+    // Threshold parameters
     static constexpr uint8_t THRESHOLD_VELOCITY = 100; // Note velocity
-    
-    // White key notes for 16 channels (C4, D4, E4, F4, G4, A4, B4, C5, D5, E5, F5, G5, A5, B5, C6, D6)
-    static constexpr uint8_t WHITE_KEY_NOTES[Ports.count] = {
-      60, 62, 64, 65, 67, 69, 71,  // C4, D4, E4, F4, G4, A4, B4
-      72, 74, 76, 77, 79, 81, 83,  // C5, D5, E5, F5, G5, A5, B5  
-      84, 86                        // C6, D6
-    };
     
     // State tracking for threshold detection
     bool _noteStates[Ports.count]{};  // Track which ports have notes on
@@ -154,7 +146,7 @@ namespace {
       // Turn off all notes before sending events
       for (uint8_t i{}; i < Ports.count; i++) {
         if (_noteStates[i]) {
-          send(_midi.setNote(config.ports[i].channel, WHITE_KEY_NOTES[i], 0));
+          send(_midi.setNote(config.ports[i].channel, config.ports[i].note, 0));
           _noteStates[i] = false;
           // Reset LED to white based on current potentiometer value
           LED.setBrightness(i, (float)_potis[i].getFraction());
@@ -194,6 +186,7 @@ namespace {
 
     bool handleSend(V2MIDI::Packet* midi) override {
       usb.midi.send(midi);
+      Plug.send(midi);
       return true;
     }
 
@@ -202,7 +195,6 @@ namespace {
         if (!force && _steps[i] == _potis[i].getStep())
           continue;
 
-        // Set LED brightness based on potentiometer value
         LED.setBrightness(i, (float)_potis[i].getFraction());
         
         // Add red color when note is playing (above threshold)
@@ -217,7 +209,9 @@ namespace {
           LED.setHSV(i, 0, 1, 1); // Red color
         } else if (!aboveThreshold && _noteStates[i]) {
           // Note Off: threshold crossed from above
-          send(_midi.setNote(config.ports[i].channel, WHITE_KEY_NOTES[i], 0));
+
+          send(_midi.setNote(config.ports[i].channel, config.ports[i].note, 0));
+
           _noteStates[i] = false;
           // Reset LED to white based on potentiometer value
           LED.setBrightness(i, currentValue);
@@ -259,7 +253,6 @@ namespace {
     void handleSystemReset() override {
       reset();
     }
-
 
     void exportSettings(JsonArray json) override {
       for (uint8_t i{}; i < Ports.count; i++) {
@@ -411,8 +404,6 @@ namespace {
 
             config.ports[i].note = value;
           }
-
-
         }
       }
     }
