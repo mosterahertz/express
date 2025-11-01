@@ -49,7 +49,7 @@ namespace {
           float max{1};
         } range;
         
-        float threshold{0.5f};  // Threshold value for note triggering
+        uint8_t threshold{64};  // Threshold value for note triggering (0 .. 127)
         uint8_t note{60};       // MIDI note number
       } ports[Ports.count];
     } config{.ports{
@@ -120,7 +120,7 @@ namespace {
     uint32_t       _measureUsec{};
     uint32_t       _eventsUsec{};
     float          _rainbow{};
-    V2MIDI::Packet _midi;
+    V2MIDI::Packet _midi{};
     
     // Threshold parameters
     static constexpr uint8_t THRESHOLD_VELOCITY = 100; // Note velocity
@@ -198,12 +198,12 @@ namespace {
         LED.setBrightness(i, (float)_potis[i].getFraction());
         
         // Add red color when note is playing (above threshold)
-        float currentValue = _potis[i].getFraction();
-        bool aboveThreshold = currentValue >= config.ports[i].threshold;
+        uint8_t currentStep = _potis[i].getStep();
+        bool aboveThreshold = currentStep >= config.ports[i].threshold;
         
         if (aboveThreshold && !_noteStates[i]) {
           // Note On: threshold crossed from below
-          send(_midi.setNote(config.ports[i].channel, WHITE_KEY_NOTES[i], THRESHOLD_VELOCITY));
+          send(_midi.setNote(config.ports[i].channel, config.ports[i].note, THRESHOLD_VELOCITY));
           _noteStates[i] = true;
           // Set LED to red when note starts playing
           LED.setHSV(i, 0, 1, 1); // Red color
@@ -214,7 +214,7 @@ namespace {
 
           _noteStates[i] = false;
           // Reset LED to white based on potentiometer value
-          LED.setBrightness(i, currentValue);
+          LED.setBrightness(i, (float)_potis[i].getFraction());
         } else if (_noteStates[i]) {
           // Note is still playing, keep red color
           LED.setHSV(i, 0, 1, 1); // Red color
@@ -330,8 +330,8 @@ namespace {
           setting["label"] = "Threshold";
           setting["text"]  = "Trigger Level";
           setting["min"]   = 0;
-          setting["max"]   = 1;
-          setting["step"]  = 0.01;
+          setting["max"]   = 127;
+          setting["step"]  = 1;
           char path[64];
           sprintf(path, "ports[%d]/threshold", i);
           setting["path"] = path;
@@ -390,9 +390,9 @@ namespace {
           }
 
           if (!jsonPort["threshold"].isNull()) {
-            float value{jsonPort["threshold"]};
-            if (value < 0.f || value > 1.f)
-              value = 0.5f;
+            uint8_t value{jsonPort["threshold"]};
+            if (value > 127)
+              value = 64;
 
             config.ports[i].threshold = value;
           }
@@ -441,9 +441,8 @@ namespace {
         }
 
         if (i == 0)
-          jsonPort["#threshold"] = "The threshold level to trigger notes (0 .. 1)";
-        jsonPort["threshold"] = serialized(String(config.ports[i].threshold, 2));
-
+          jsonPort["#threshold"] = "The threshold level to trigger notes (0 .. 127)";
+        jsonPort["threshold"] = config.ports[i].threshold;
       }
     }
 
