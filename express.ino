@@ -37,6 +37,10 @@ namespace {
       Rainbow = V2MIDI::CC::Controller90,
     };
 
+    // Calibration note numbers
+    static constexpr uint8_t CALIBRATION_START_NOTE = 0;  // Note 0 (C-2) starts calibration
+    static constexpr uint8_t CALIBRATION_STOP_NOTE = 1;   // Note 1 (C#-2) stops calibration
+
     // Config, written to EEPROM
     struct {
       struct {
@@ -49,7 +53,7 @@ namespace {
           float max{1};
         } range;
         
-        uint8_t threshold{64};  // Threshold value for note triggering (0 .. 127)
+        uint8_t threshold{20};  // Threshold value for note triggering (0 .. 127)
         uint8_t note{60};       // MIDI note number
       } ports[Ports.count];
     } config{.ports{
@@ -119,6 +123,7 @@ namespace {
     uint8_t        _steps[Ports.count]{};
     uint32_t       _measureUsec{};
     uint32_t       _eventsUsec{};
+    uint32_t       _ledResetUsec{};
     float          _rainbow{};
     V2MIDI::Packet _midi{};
     
@@ -127,6 +132,11 @@ namespace {
     
     // State tracking for threshold detection
     bool _noteStates[Ports.count]{};  // Track which ports have notes on
+    
+    // Calibration state
+    bool _calibrationActive{false};
+    float _calibrationMin[Ports.count]{};  // Track minimum values during calibration
+    float _calibrationMax[Ports.count]{};  // Track maximum values during calibration
 
     void handleReset() override {
       LED.reset();
@@ -138,8 +148,13 @@ namespace {
       memset(_noteStates, 0, sizeof(_noteStates));  // Reset note states
       _measureUsec = 0;
       _eventsUsec  = V2Base::getUsec();
+      _ledResetUsec = 0;
       _rainbow     = 0;
       _midi        = {};
+      _calibrationActive = false;
+      memset(_calibrationMin, 0, sizeof(_calibrationMin));
+      for (uint8_t i{}; i < Ports.count; i++)
+        _calibrationMax[i] = 0.f;  // Initialize max to 0, will be updated during calibration
     }
 
     void allNotesOff() {
@@ -153,6 +168,97 @@ namespace {
         }
       }
       sendEvents(true);
+    }
+
+    void startCalibration() {
+      // Initialize calibration tracking
+      _calibrationActive = true;
+      for (uint8_t i{}; i < Ports.count; i++) {
+        const uint8_t id{V2Base::Analog::ADC::getID(PIN_CHANNEL_SENSE + i)};
+        const uint8_t channel{V2Base::Analog::ADC::getChannel(PIN_CHANNEL_SENSE + i)};
+        float measure{ADC[id].readChannel(channel)};
+        
+        if (config.ports[i].range.invert)
+          measure = 1.f - measure;
+        
+        // Initialize min and max with current reading
+        _calibrationMin[i] = measure;
+        _calibrationMax[i] = measure;
+      }
+      // Visual feedback: turn on all LEDs in blue to indicate calibration mode
+      for (uint8_t i{}; i < Ports.count; i++)
+        LED.setHSV(i, 240, 1, 0.5); // Blue color, half brightness
+    }
+
+    void stopCalibration() {
+      if (!_calibrationActive)
+        return;
+        
+      _calibrationActive = false;
+      
+      // Minimum range threshold to accept calibration (5% of full range)
+      static constexpr float MIN_CALIBRATION_RANGE = 0.05f;
+      
+      // Write calibration values directly to config struct
+      for (uint8_t i{}; i < Ports.count; i++) {
+        // Ensure values are valid
+        float minVal = _calibrationMin[i];
+        float maxVal = _calibrationMax[i];
+        
+        if (minVal < 0.f) minVal = 0.f;
+        if (minVal > 1.f) minVal = 1.f;
+        if (maxVal < 0.f) maxVal = 0.f;
+        if (maxVal > 1.f) maxVal = 1.f;
+        
+        // Ensure min < max
+        if (minVal >= maxVal) {
+          if (maxVal < 0.99f)
+            maxVal = minVal + 0.01f;
+          else
+            minVal = maxVal - 0.01f;
+        }
+        
+        // Calculate the calibration range
+        float calibrationRange = maxVal - minVal;
+        
+        // Only update channels with a valid calibration range (reject small/noisy ranges)
+        if (calibrationRange >= MIN_CALIBRATION_RANGE) {
+          config.ports[i].range.min = minVal;
+          config.ports[i].range.max = maxVal;
+        }
+        // Channels with range < MIN_CALIBRATION_RANGE keep their existing config
+      }
+      
+      // Write configuration to EEPROM
+      writeConfiguration();
+      
+      // Visual feedback: flash LEDs green briefly, then return to normal
+      for (uint8_t i{}; i < Ports.count; i++)
+        LED.setHSV(i, 120, 1, 1); // Green color
+      
+      // Reset LEDs after a short delay (will be handled in loop)
+      _ledResetUsec = V2Base::getUsec();
+    }
+
+    void updateCalibration() {
+      if (!_calibrationActive)
+        return;
+        
+      // Update min and max values for all channels
+      for (uint8_t i{}; i < Ports.count; i++) {
+        const uint8_t id{V2Base::Analog::ADC::getID(PIN_CHANNEL_SENSE + i)};
+        const uint8_t channel{V2Base::Analog::ADC::getChannel(PIN_CHANNEL_SENSE + i)};
+        float measure{ADC[id].readChannel(channel)};
+        
+        if (config.ports[i].range.invert)
+          measure = 1.f - measure;
+        
+        // Update min and max
+        if (measure < _calibrationMin[i])
+          _calibrationMin[i] = measure;
+        if (measure > _calibrationMax[i])
+          _calibrationMax[i] = measure;
+      }
     }
 
     void handleLoop() override {
@@ -176,6 +282,17 @@ namespace {
           _potis[i].measure(measurePort(i));
 
         _measureUsec = V2Base::getUsec();
+        
+        // Update calibration min/max during calibration
+        if (_calibrationActive)
+          updateCalibration();
+      }
+      
+      // Reset LEDs after calibration stop (after 500ms)
+      if (_ledResetUsec > 0 && V2Base::getUsecSince(_ledResetUsec) > 500 * 1000) {
+        for (uint8_t i{}; i < Ports.count; i++)
+          LED.setBrightness(i, (float)_potis[i].getFraction());
+        _ledResetUsec = 0; // Reset timer
       }
 
       if (V2Base::getUsecSince(_eventsUsec) > 50 * 1000) {
@@ -226,10 +343,25 @@ namespace {
     }
 
     void handleNote(uint8_t channel, uint8_t note, uint8_t velocity) override {
+      // Check for calibration notes
+      if (note == CALIBRATION_START_NOTE && velocity > 0) {
+        startCalibration();
+        return;
+      }
+      
+      if (note == CALIBRATION_STOP_NOTE && velocity > 0) {
+        stopCalibration();
+        return;
+      }
+      
       play(note, velocity);
     }
 
     void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) override {
+      // Calibration notes don't use note off
+      if (note == CALIBRATION_START_NOTE || note == CALIBRATION_STOP_NOTE)
+        return;
+        
       play(note, 0);
     }
 
@@ -337,6 +469,29 @@ namespace {
           setting["path"] = path;
         }
       }
+      {
+        JsonObject setting{json.add<JsonObject>()};
+        setting["type"] = "title";
+        setting["title"] = "Calibration";
+      }
+      {
+        JsonObject setting{json.add<JsonObject>()};
+        setting["type"] = "button";
+        setting["label"] = "Start";
+        setting["text"] = "Start Calibration";
+        char path[64];
+        sprintf(path, "notes/%d", CALIBRATION_START_NOTE);
+        setting["path"] = path;
+      }
+      {
+        JsonObject setting{json.add<JsonObject>()};
+        setting["type"] = "button";
+        setting["label"] = "Stop";
+        setting["text"] = "Stop Calibration";
+        char path[64];
+        sprintf(path, "notes/%d", CALIBRATION_STOP_NOTE);
+        setting["path"] = path;
+      }
     }
 
     void importConfiguration(JsonObject json) override {
@@ -392,7 +547,7 @@ namespace {
           if (!jsonPort["threshold"].isNull()) {
             uint8_t value{jsonPort["threshold"]};
             if (value > 127)
-              value = 64;
+              value = 20;
 
             config.ports[i].threshold = value;
           }
@@ -457,6 +612,20 @@ namespace {
         jsonController["name"]   = "Rainbow";
         jsonController["number"] = (uint8_t)CC::Rainbow;
         jsonController["value"]  = (uint8_t)(_rainbow * 127.f);
+      }
+      
+      JsonArray jsonNotes{json["notes"].to<JsonArray>()};
+      {
+        JsonObject jsonNote{jsonNotes.add<JsonObject>()};
+        jsonNote["name"]   = "Calibration Start";
+        jsonNote["number"] = CALIBRATION_START_NOTE;
+        jsonNote["value"]  = 0;
+      }
+      {
+        JsonObject jsonNote{jsonNotes.add<JsonObject>()};
+        jsonNote["name"]   = "Calibration Stop";
+        jsonNote["number"] = CALIBRATION_STOP_NOTE;
+        jsonNote["value"]  = 0;
       }
     }
 
